@@ -1,0 +1,207 @@
+# ============================================================
+# data_collect_pico.py
+# Edge AI 시리즈 2편 - Pico 2W 데이터 수집 트리거
+#
+# 사용자가 양손을 자유롭게 쓸 수 있도록, Pico의 버튼을 누르면
+# WiFi UDP로 PC에 캡처 신호를 보냅니다. PC의 hand_collect.py가
+# 그 신호를 받아 latest_segmented 이미지를 클래스 폴더에 저장합니다.
+#
+# 하드웨어 구성:
+#   캡처 버튼  : GPIO27 (내부 풀업, 누르면 LOW)
+#   클래스 전환: GPIO14 (내부 풀업, 누르면 LOW)
+#   OLED      : I2C0  SDA=GP4, SCL=GP5, 주소 0x3C
+#
+# 데이터 흐름:
+#   캡처 버튼 클릭 → UDP 송신 "CAPTURE,<현재 클래스명>"
+#   전환 버튼 클릭 → 다음 클래스로 순환 (fist → index → victory → ok → fist)
+#
+# UDP:
+#   목적지 = PC IP, 포트 4220
+# ============================================================
+
+import network
+import socket
+import time
+from machine import Pin, I2C
+from ssd1306 import SSD1306_I2C   # micropython-ssd1306 라이브러리
+
+
+# ============================================================
+# 사용자 설정 - 본인 환경에 맞게 수정
+# ============================================================
+WIFI_SSID = "YOUR_WIFI_SSID"
+WIFI_PASS = "YOUR_WIFI_PASSWORD"
+
+# PC IP 주소 (hand_collect.py가 동작하는 PC)
+# Windows에서 cmd > ipconfig 로 확인
+PC_IP   = "192.168.219.100"
+PC_PORT = 4220
+
+# 수집 클래스 목록 (순환 순서)
+CLASSES = ["fist", "index", "victory", "ok"]
+
+# 클래스당 목표 수량 (OLED 표시용)
+TARGET_PER_CLASS = 100
+
+
+# ============================================================
+# 하드웨어 초기화
+# ============================================================
+
+# 버튼: 내부 풀업 사용, 눌렀을 때 LOW로 떨어짐
+btn_capture = Pin(27, Pin.IN, Pin.PULL_UP)
+btn_change  = Pin(14, Pin.IN, Pin.PULL_UP)
+
+# OLED I2C 초기화
+i2c = I2C(0, sda=Pin(4), scl=Pin(5), freq=400000)
+oled = SSD1306_I2C(128, 64, i2c, addr=0x3C)
+
+
+# ============================================================
+# 상태 변수
+# ============================================================
+class_idx = 0                  # 현재 클래스 인덱스 (0~3)
+counts = {cls: 0 for cls in CLASSES}   # 클래스별 송신 카운트
+
+# 디바운싱용 시간 기록 (밀리초)
+last_capture_ms = 0
+last_change_ms  = 0
+DEBOUNCE_MS = 300
+
+
+# ============================================================
+# OLED 화면 갱신
+# ============================================================
+def draw_oled():
+    oled.fill(0)
+
+    # 헤더
+    oled.text("Data Collect", 14, 0)
+    oled.hline(0, 11, 128, 1)
+
+    # 현재 클래스
+    cur = CLASSES[class_idx]
+    oled.text("Class:", 0, 18)
+    oled.text(cur, 56, 18)
+
+    # 현재 클래스 수집 개수
+    cnt = counts[cur]
+    line = "Count: {}/{}".format(cnt, TARGET_PER_CLASS)
+    oled.text(line, 0, 32)
+
+    # 진행률 바
+    bar_max = 124
+    bar_len = int(bar_max * min(cnt, TARGET_PER_CLASS) / TARGET_PER_CLASS)
+    oled.rect(2, 44, bar_max, 6, 1)
+    oled.fill_rect(2, 44, bar_len, 6, 1)
+
+    # 안내 (목표 달성 시 강조)
+    if cnt >= TARGET_PER_CLASS:
+        oled.text("PRESS CHANGE", 8, 54)
+    else:
+        oled.text("BTN27=cap 14=nx", 0, 54)
+
+    oled.show()
+
+
+# ============================================================
+# WiFi 연결
+# ============================================================
+def connect_wifi():
+    oled.fill(0)
+    oled.text("WiFi connecting", 0, 24)
+    oled.show()
+
+    wlan = network.WLAN(network.STA_IF)
+    wlan.active(True)
+    wlan.connect(WIFI_SSID, WIFI_PASS)
+
+    # 최대 20초 대기
+    for _ in range(40):
+        if wlan.isconnected():
+            break
+        time.sleep(0.5)
+
+    if not wlan.isconnected():
+        oled.fill(0)
+        oled.text("WiFi FAIL", 20, 24)
+        oled.text("Check SSID/PW", 0, 40)
+        oled.show()
+        print("WiFi 연결 실패")
+        while True:
+            time.sleep(1)
+
+    ip = wlan.ifconfig()[0]
+    print("WiFi 연결 완료:", ip)
+
+    oled.fill(0)
+    oled.text("WiFi OK", 28, 16)
+    oled.text("IP:", 0, 36)
+    oled.text(ip, 0, 48)
+    oled.show()
+    time.sleep(1.5)
+
+
+# ============================================================
+# UDP 송신
+# ============================================================
+sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+
+
+def send_capture():
+    """현재 클래스의 캡처 트리거를 PC에 송신."""
+    cur = CLASSES[class_idx]
+    msg = "CAPTURE,{}".format(cur)
+    try:
+        sock.sendto(msg.encode(), (PC_IP, PC_PORT))
+        counts[cur] += 1
+        print("[send]", msg, "count:", counts[cur])
+    except Exception as e:
+        print("UDP 송신 실패:", e)
+
+
+# ============================================================
+# 메인 루프
+# ============================================================
+def main():
+    global class_idx, last_capture_ms, last_change_ms
+
+    connect_wifi()
+
+    # 시작 시 첫 화면 그리기
+    draw_oled()
+    print("=== 데이터 수집 트리거 시작 ===")
+    print("캡처: GPIO27, 전환: GPIO14")
+    print("현재 클래스:", CLASSES[class_idx])
+
+    while True:
+        now = time.ticks_ms()
+
+        # ----- 캡처 버튼 -----
+        if btn_capture.value() == 0:   # 눌림 (PULL_UP이라 LOW)
+            if time.ticks_diff(now, last_capture_ms) > DEBOUNCE_MS:
+                last_capture_ms = now
+                send_capture()
+                draw_oled()
+
+        # ----- 클래스 전환 버튼 -----
+        if btn_change.value() == 0:
+            if time.ticks_diff(now, last_change_ms) > DEBOUNCE_MS:
+                last_change_ms = now
+                class_idx = (class_idx + 1) % len(CLASSES)
+                print("클래스 전환 →", CLASSES[class_idx])
+                draw_oled()
+
+        # CPU 부담 줄이기
+        time.sleep_ms(20)
+
+
+# 실행
+try:
+    main()
+except KeyboardInterrupt:
+    print("\n중단됨")
+    oled.fill(0)
+    oled.text("STOPPED", 36, 28)
+    oled.show()
+
